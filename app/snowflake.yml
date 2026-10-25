@@ -1,0 +1,14 @@
+definition_version: 2
+entities:
+  pr_guardian_dashboard:
+    type: streamlit
+    identifier:
+      name: PR_GUARDIAN_DASHBOARD
+      database: PR_GUARDIAN_DEMO
+      schema: APP
+    title: PR Guardian - Control room
+    query_warehouse: COMPUTE_WH
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - environment.yml
