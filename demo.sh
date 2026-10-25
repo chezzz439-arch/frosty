@@ -4,6 +4,7 @@
 #   ./demo.sh violation      open planted PR 01, judge it, fix it, test it, merge it
 #   ./demo.sh decoy          PR 02 -- the one Guardian must ALLOW
 #   ./demo.sh ambiguous      PR 03 -- the one Guardian must ESCALATE
+#   ./demo.sh show           all three in order, pausing for Enter before each
 #   ./demo.sh reset          close the PRs, put the demo shop back to `baseline`
 #
 # Same four steps, same four Snowflake tables and the same real GitHub PR as the
@@ -34,6 +35,38 @@ command -v gh >/dev/null || die "gh not found"
 WHICH="${1:-violation}"
 if [ "$WHICH" = reset ]; then
   DEMO_REPO_DIR="$SHOP_DIR" "$FROSTY/demo-data/planted.sh" reset
+  exit 0
+fi
+
+# Presenting mode. Each PR is run by re-invoking this script, so the three runs
+# are the exact same path as ./demo.sh violation -- no second copy to drift.
+if [ "$WHICH" = show ]; then
+  for p in violation decoy ambiguous; do
+    upper="$(printf '%s' "$p" | tr '[:lower:]' '[:upper:]')"
+    printf '\nPress Enter to run the %s PR' "$upper"
+    read -r _
+    out="$(mktemp)"
+    # Never let one failed PR abort the other two mid-presentation; the result
+    # line below reports what actually happened either way.
+    "$0" "$p" 2>&1 | tee "$out" || true
+    printf '\n\033[1;32m%s\033[0m\n' "$(python3 - "$out" "$upper" <<'PY'
+import json, re, sys
+text = open(sys.argv[1], errors="replace").read()
+m = re.search(r'^\{"pr".*\}$', text, re.M)
+if m:
+    r = json.loads(m.group(0))
+    print(f'{sys.argv[2]}  PR #{r["pr"]}  {r["decision"].upper()}  '
+          f'merged={str(r["merged"]).lower()}  {r["receipt_url"]}')
+else:
+    d = re.search(r'^PR #(\d+): (\w+)', text, re.M)
+    print(f'{sys.argv[2]}  PR #{d.group(1)}  {d.group(2).upper()}  (merge step did not report)'
+          if d else f'{sys.argv[2]}  no result line found')
+PY
+)"
+    rm -f "$out"
+  done
+  echo
+  echo "Done."
   exit 0
 fi
 
