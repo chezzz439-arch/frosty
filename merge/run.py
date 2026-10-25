@@ -185,11 +185,21 @@ def receipt_comment(pr, decision, v, merged, changed):
 
 
 def slack(pr, decision, reason, merged, url):
+    """Post the ping. Returns False when there is no webhook to post to.
+
+    Announcing the decision is the last step and the only one with no effect
+    on the repository or the tables. Raising here used to abort the run AFTER
+    the PR had already been merged and the receipt written, which reported a
+    failure for work that had in fact succeeded. A missing webhook is now a
+    skipped step, not a failed run; a webhook that is set but broken still
+    raises, because that is a real fault worth seeing.
+    """
     webhook = os.getenv('SLACK_WEBHOOK_URL')
     if not webhook:
-        raise RuntimeError('Missing SLACK_WEBHOOK_URL')
+        return False
     response = requests.post(webhook, json={'text':f'PR Guardian · PR #{pr} · {decision.upper()} · merged={merged}\n{reason}\n{url}'}, timeout=15)
     response.raise_for_status()
+    return True
 
 
 def process(pr):
@@ -235,8 +245,10 @@ def process(pr):
             cur.execute('INSERT INTO RECEIPTS (pr_number, decision, reason, merged, receipt_url, created_at) VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP())',
                         (pr,decision,v['reason'],merged,comment_url))
         event(db, pr, 'receipt stored', 'ok', comment_url)
-        slack(pr, decision, v['reason'], merged, url)
-        event(db, pr, 'Slack sent', 'ok', url)
+        if slack(pr, decision, v['reason'], merged, url):
+            event(db, pr, 'slack', 'ok', url)
+        else:
+            event(db, pr, 'slack', 'ok', 'skipped: no webhook configured')
         print(json.dumps({'pr':pr,'decision':decision,'merged':merged,'receipt_url':comment_url}))
 
 
