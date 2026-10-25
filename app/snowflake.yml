@@ -6,7 +6,7 @@ entities:
       name: PR_GUARDIAN_DASHBOARD
       database: PR_GUARDIAN_DEMO
       schema: APP
-    title: PR Guardian - Control room
+    title: Frosty - Control room
     query_warehouse: PR_GUARDIAN_WH  # COMPUTE_WH does not exist on this account
     main_file: streamlit_app.py
     artifacts:

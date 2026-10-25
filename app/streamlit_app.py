@@ -226,7 +226,7 @@ def main():
     import pandas as pd
     import streamlit as st
 
-    st.set_page_config(page_title="PR Guardian | Control room", page_icon="🛡️", layout="wide")
+    st.set_page_config(page_title="Frosty - Control room", page_icon="🛡️", layout="wide")
     st.markdown("""<style>
     .block-container {padding-top:2rem; max-width:1450px}
     h1 {letter-spacing:-1.5px} h2,h3 {letter-spacing:-.5px}
