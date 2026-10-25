@@ -281,7 +281,12 @@ def main() -> int:
         )
         print(f"RECEIPTS  #{pr_number}  {decision}")
 
-    print(f"\nwrote to {db.db_path()}")
+    where = (
+        f"Snowflake {db.DATABASE}.{db.SCHEMA} via connection {db.connection_name()}"
+        if db.backend() == db.SNOWFLAKE
+        else db.db_path()
+    )
+    print(f"\nwrote to {where}")
     print(f"demo checkout at {root}")
     print(f"\nNow: PR_GUARDIAN_REPO={root} python engine/run.py 101")
     return 0

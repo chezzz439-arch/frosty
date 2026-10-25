@@ -7,6 +7,11 @@ these pass fakes that return canned responses. That covers the plumbing and the
 fail-safe paths. It does NOT check that the real model rules correctly on the
 three planted PRs -- that needs a live call.
 
+The store is pinned to SQLite below for the same reason. These tests are not
+an integration check against Snowflake: they must pass on a laptop with no
+credentials, and they must not spend warehouse time or write rows into the
+table the dashboard is reading.
+
 stdlib unittest, not pytest, so the engine's own tests add no dependency.
 """
 
@@ -18,9 +23,10 @@ import subprocess
 import tempfile
 import unittest
 
-# Point db at a scratch file before importing anything that opens it.
+# Both set before importing anything that opens the store.
 _TMP = tempfile.mkdtemp(prefix="pr-guardian-test-")
 os.environ["PR_GUARDIAN_DB"] = os.path.join(_TMP, "test.db")
+os.environ["PR_GUARDIAN_DB_BACKEND"] = "sqlite"
 
 import shutil  # noqa: E402
 
