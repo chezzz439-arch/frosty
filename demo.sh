@@ -88,7 +88,13 @@ export PR_GUARDIAN_RULES="$FROSTY/demo-data/rules.md"
 export PR_GUARDIAN_TEST_CMD="${PR_GUARDIAN_TEST_CMD:-python3 -m pytest -q}"
 
 step "0 · Open planted PR: $WHICH"
-DEMO_REPO_DIR="$SHOP_DIR" "$FROSTY/demo-data/planted.sh" open "$WHICH"
+# Don't let a failure here abort the script silently: if this planted PR has
+# already been merged, its files are on main, `cp` changes nothing and the
+# commit fails with "nothing to commit". That needs to say so, not vanish.
+if ! DEMO_REPO_DIR="$SHOP_DIR" "$FROSTY/demo-data/planted.sh" open "$WHICH"; then
+  die "Could not open the $WHICH PR. If it was already merged its change is
+already on main, so there is no diff left to open. Run ./demo.sh reset first."
+fi
 
 BRANCH="$(sed -n 's/^branch: //p' "$FROSTY/demo-data/planted-prs/"*"-$WHICH/pr.md" | head -1)"
 PR="$(gh pr view "$BRANCH" -R "$SHOP_REPO" --json number -q .number)"
