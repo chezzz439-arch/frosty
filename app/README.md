@@ -24,7 +24,7 @@ python3 -m unittest discover -s app/tests -v
 
 Choose the team's DATABASE.SCHEMA and GitHub repository in the sidebar. No code change is needed to switch data sources. Optional defaults: `GUARDIAN_TABLE_PREFIX`, `GUARDIAN_REPO`. Missing verdict permissions show confidence as “Not supplied”; required event/receipt failures remain visible and never fall back silently to fake data.
 
-One expandable card per PR shows steps oldest first, confidence and reason, pass/fail/waiting states and decision colors: blue fix, green allow, amber escalate. Cards are sorted by newest activity. Live feed refreshes every three seconds; receipt search and the manual form do not auto-refresh while editing. Receipt history supports decision filters, text search, details, PR links and JSON download. Times are UTC.
+One expandable card per PR shows steps oldest first, confidence and reason, ok/failed/running states (the only values PR_EVENTS.STATUS carries) and decision colors: blue fix, green allow, amber escalate. Cards are sorted by newest activity. Live feed refreshes every three seconds; receipt search and the manual form do not auto-refresh while editing. Receipt history supports decision filters, text search, details, PR links and JSON download. Times are UTC.
 
 ASSUMPTION: guide tables cover one repository and one current pipeline run per PR. They have no run IDs or commit SHAs, so reruns are grouped under their PR number. The dashboard does not invent commit identities. The engine team should agree on future run identifiers separately before using this across repositories.
 
@@ -35,7 +35,7 @@ In Team mode, the button executes only this parameterized write:
 ```sql
 INSERT INTO <configured_database>.<configured_schema>.PR_EVENTS
   (PR_NUMBER, STEP, STATUS, DETAIL, TS)
-SELECT ?, 'manual run requested', 'waiting', ?, CURRENT_TIMESTAMP();
+SELECT ?, 'manual run requested', 'running', ?, CURRENT_TIMESTAMP();
 ```
 
 The detail includes a request ID and repository. Agree on these exact step/status values with Erik's worker. Inserting an event does not start a GitHub Action by itself: the worker must consume it, deduplicate/authorize it and apply the normal checks. The button has no merge credentials. Standard table INSERT privileges cannot restrict writes to a particular row type; the app itself limits its only Team-mode write to this event. Deploy under a least-privilege app-owner role before sharing.

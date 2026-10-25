@@ -193,9 +193,12 @@ def read_team(st, prefix, repo="chezzz439-arch/frosty"):
         pr = int(e["pr_number"])
         rid = f"pr-{pr}"
         e.update(run_id=rid, repo=repo, head_sha="Not supplied by team tables")
-        status = str(e.get("status") or "waiting").lower()
-        state = ("completed" if pr in complete else "failed" if e["step"] in ["run_failed", "failed"]
-                 else "queued" if status in ["queued", "waiting", "pending"] else "running")
+        # PR_EVENTS.STATUS is ok / failed / running -- nothing else is written.
+        # Failure is carried by STATUS, not by the step name: the engine logs
+        # ('diff read', 'failed'), so matching on step missed every real failure.
+        status = str(e.get("status") or "running").lower()
+        state = ("completed" if pr in complete else "failed" if status == "failed"
+                 else "running")
         v = latest.get(pr, {})
         seen[rid] = {"run_id": rid, "repo": repo, "pr_number": pr,
                      "head_sha": "Not supplied by team tables", "created_at": str(e["ts"]),
@@ -212,8 +215,11 @@ def read_team(st, prefix, repo="chezzz439-arch/frosty"):
 
 
 def manual_event_sql(prefix):
+    # STATUS is 'running': the four-table contract allows exactly ok / failed /
+    # running, and a requested-but-unfinished run is 'running'. It was 'waiting',
+    # which no other component writes or reads.
     return (f"INSERT INTO {qualified_prefix(prefix)}.PR_EVENTS (PR_NUMBER,STEP,STATUS,DETAIL,TS) "
-            "SELECT ?,'manual run requested','waiting',?,CURRENT_TIMESTAMP()")
+            "SELECT ?,'manual run requested','running',?,CURRENT_TIMESTAMP()")
 
 
 def main():
@@ -280,7 +286,8 @@ def main():
             else:
                 for run in runs:
                     selected = run["run_id"]
-                    decision = str(run.get("decision") or "waiting").lower()
+                    # VERDICTS.DECISION is fix / allow / escalate; no row yet means no verdict.
+                    decision = str(run.get("decision") or "no verdict yet").lower()
                     color = {"fix": "#2463b5", "allow": "#17745b", "escalate": "#99620c"}.get(decision, "#526b7b")
                     with st.expander(f"{run['repo']} #{run['pr_number']} · {run['state']}", expanded=True):
                         st.markdown(f'<b style="color:{color}">{html.escape(decision.upper())}</b>', unsafe_allow_html=True)
@@ -296,7 +303,8 @@ def main():
                             st.info("Waiting for the first pipeline step.")
                         for e in events:
                             status = str(e["status"]).lower()
-                            cls = status if status in ["failed", "warning"] else "queued" if status in ["queued", "waiting", "pending", "running"] else "passed"
+                            # ok / failed / running are the only statuses written.
+                            cls = {"failed": "failed", "running": "queued"}.get(status, "passed")
                             title = html.escape(str(e["step"]).replace("_", " ").title())
                             detail = html.escape(str(e.get("detail") or ""))
                             stamp = html.escape(str(e["ts"]))

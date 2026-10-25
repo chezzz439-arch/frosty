@@ -78,7 +78,7 @@ class DashboardTests(unittest.TestCase):
                 return self
             def collect(self):
                 if self.table == 'events':
-                    return [Row({'PR_NUMBER':pr,'STEP':'tests_passed','STATUS':'passed','DETAIL':'test','TS':stamp})
+                    return [Row({'PR_NUMBER':pr,'STEP':'tests_passed','STATUS':'ok','DETAIL':'test','TS':stamp})
                             for pr,stamp in [(2,'2026-10-25T18:01:00+00:00'),(1,'2026-10-25T18:00:00+00:00')]]
                 if self.table == 'verdicts':
                     return [Row({'PR_NUMBER':2,'DECISION':'fix','CONFIDENCE':0.98,'REASON':'log leak'})]
@@ -93,7 +93,8 @@ class DashboardTests(unittest.TestCase):
     def test_manual_button_only_inserts_guide_event(self):
         sql = app.manual_event_sql('guardian.app')
         self.assertIn('GUARDIAN.APP.PR_EVENTS (PR_NUMBER,STEP,STATUS,DETAIL,TS)', sql)
-        self.assertIn("'manual run requested','waiting'", sql)
+        self.assertIn("'manual run requested','running'", sql)
+        self.assertNotIn('waiting', sql)
         self.assertNotIn('MANUAL_REQUESTS', sql)
         self.assertEqual(sql.count('?'), 2)
         with self.assertRaises(ValueError): app.manual_event_sql('x.y;DROP')

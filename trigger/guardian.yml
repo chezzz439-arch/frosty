@@ -37,19 +37,19 @@ jobs:
       SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
       SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
       SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-      # The judge: set ONE of these two secrets (an API key outranks the OAuth token).
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # The judge. ANTHROPIC_API_KEY is deliberately NOT set here: engine/backends.py
+      # prefers it over the OAuth token, so passing both (even blank) risks picking the
+      # wrong credential. The OAuth token from `claude setup-token` is the one we use.
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       GITHUB_TOKEN: ${{ github.token }}
       GH_TOKEN: ${{ github.token }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       # Rules come from frosty, never from the PR: a PR must not be able to edit the rules it's judged by.
       PR_GUARDIAN_RULES: ${{ github.workspace }}/guardian/demo-data/rules.md
-      # ASSUMPTION: names for the engine's sandbox step (not built yet). Agree these with Kaushik.
+      # Agreed with Kaushik: engine/workspace.py reads PR_GUARDIAN_REPO_DIR, and
+      # engine/run.py runs PR_GUARDIAN_TEST_CMD inside its sandbox copy of repo/.
       PR_GUARDIAN_REPO_DIR: ${{ github.workspace }}/repo
       PR_GUARDIAN_TEST_CMD: python -m pytest -q
-      # Shared by trigger and engine while engine/db.py is still the local SQLite store.
-      PR_GUARDIAN_DB: ${{ github.workspace }}/.guardian-local/pr_guardian.db
     steps:
       - name: Check out the PR (full history, so the diff works)
         uses: actions/checkout@v4
@@ -75,8 +75,8 @@ jobs:
             if [ -f "$f" ]; then pip install -q -r "$f"; fi
           done
 
-      - name: Install Claude Code CLI (only when using the OAuth token)
-        if: env.CLAUDE_CODE_OAUTH_TOKEN != '' && env.ANTHROPIC_API_KEY == ''
+      - name: Install Claude Code CLI (the judge runs through `claude -p`)
+        if: env.CLAUDE_CODE_OAUTH_TOKEN != ''
         run: npm install -g @anthropic-ai/claude-code
 
       - name: "1 · Send diff to Guardian (Erik)"
