@@ -18,19 +18,16 @@ one row per push. The engine reads the newest row per PR. Writes `PR_EVENTS` `pr
 
 ## Where it writes
 
-`--store auto` (the default) writes to **every store that's available**:
-- **local**: `engine/db.py`'s own functions, at `PR_GUARDIAN_DB`. That's what the engine reads today,
-  so the chain works before the Snowflake swap.
-- **snowflake**: `PR_GUARDIAN.CORE` on warehouse `PR_GUARDIAN_WH` (from `sql/setup.sql`), when
-  `SNOWFLAKE_ACCOUNT` is set or `--connection` is given.
-
-When `engine/db.py` moves to Snowflake, nothing here changes.
+`--store auto` (the default) writes **through `engine/db.py`** when it's checked out, so the row
+lands in whatever store the engine reads: Snowflake `PR_GUARDIAN.CORE` by default, using the snow
+connection named in `PR_GUARDIAN_SNOWFLAKE_CONNECTION` (or SQLite with `PR_GUARDIAN_DB_BACKEND=sqlite`).
+Without `engine/`, it writes to Snowflake directly with `sf.py`. Never both, so rows aren't doubled.
 
 ## Run it
 
 ```
+export PR_GUARDIAN_SNOWFLAKE_CONNECTION=<your snow connection>   # `snow connection list`
 python trigger/send_diff.py --planted violation              # 101; decoy 102, ambiguous 103
-python trigger/send_diff.py --planted decoy --connection <snow conn>   # also into Snowflake
 python trigger/send_diff.py --repo <owner>/frosty-demo-shop --pr 4     # any real PR (manual backup)
 python trigger/send_diff.py --from-event                     # what the Action runs
 ... --dry-run                                                # print, write nothing
@@ -49,8 +46,7 @@ Steps 2 and 3 are skipped until those files exist on `GUARDIAN_REF`. Environment
 | --- | --- |
 | `PR_NUMBER`, `PR_REPO`, `PR_BRANCH` | everyone |
 | `PR_GUARDIAN_RULES` = frosty's `demo-data/rules.md` | engine. The trusted copy, so a PR can't rewrite its own rules. |
-| `PR_GUARDIAN_REPO_DIR`, `PR_GUARDIAN_TEST_CMD` = `python -m pytest -q` | engine sandbox. **ASSUMPTION**: names to confirm with Kaushik. |
-| `PR_GUARDIAN_DB` | shared local db for trigger + engine |
+| `PR_GUARDIAN_REPO_DIR`, `PR_GUARDIAN_TEST_CMD` = `python -m pytest -q` | engine: the PR tree to read, sandbox and test (both names confirmed in `engine/workspace.py`) |
 | `ANTHROPIC_API_KEY` **or** `CLAUDE_CODE_OAUTH_TOKEN` | engine judge. The CLI is installed only when the token is the one set. |
 | `GITHUB_TOKEN`, `GH_TOKEN`, `SLACK_WEBHOOK_URL` | merge |
 | `SNOWFLAKE_*` | everyone |

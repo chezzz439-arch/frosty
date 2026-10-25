@@ -45,11 +45,12 @@ jobs:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       # Rules come from frosty, never from the PR: a PR must not be able to edit the rules it's judged by.
       PR_GUARDIAN_RULES: ${{ github.workspace }}/guardian/demo-data/rules.md
-      # ASSUMPTION: names for the engine's sandbox step (not built yet). Agree these with Kaushik.
+      # The tree the engine reads, sandboxes and tests (engine/workspace.py accepts this name),
+      # and the demo shop's real suite (the engine's default is unittest discovery).
       PR_GUARDIAN_REPO_DIR: ${{ github.workspace }}/repo
       PR_GUARDIAN_TEST_CMD: python -m pytest -q
-      # Shared by trigger and engine while engine/db.py is still the local SQLite store.
-      PR_GUARDIAN_DB: ${{ github.workspace }}/.guardian-local/pr_guardian.db
+      # engine/db.py signs in to Snowflake from SNOWFLAKE_ACCOUNT/USER/PRIVATE_KEY above (they win
+      # over a named connection), so the runner needs no connections.toml.
     steps:
       - name: Check out the PR (full history, so the diff works)
         uses: actions/checkout@v4

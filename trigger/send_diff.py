@@ -7,14 +7,17 @@ The engine then logs "diff read" when it picks the row up.
 Where the diff comes from (pick one):
   --from-event                    inside the GitHub Action ($GITHUB_EVENT_PATH + git)
   --repo OWNER/NAME --pr N        any real PR, from a laptop (gh CLI). Also the manual backup path.
-  --planted violation|decoy|ambiguous [--pr N]
+  --planted violation|decoy|ambiguous [--pr N] [--checkout DIR]
                                   build a planted PR's diff locally from demo-data/, no GitHub
                                   needed. Default PR numbers 101/102/103 match engine/seed_fake_rows.py.
+                                  --checkout DIR also writes the PR branch's files to DIR, for
+                                  PR_GUARDIAN_REPO=DIR (the engine reads whole files and tests there).
 
 Where it goes (--store, default auto):
-  local      engine/db.py's local database (PR_GUARDIAN_DB), the store the engine reads today
-  snowflake  PR_GUARDIAN.CORE.PR_DIFFS / PR_EVENTS (see sf.py for the connection)
-  auto       every store that's available: local if engine/db.py exists, plus Snowflake if configured
+  engine     through engine/db.py, so the row lands wherever the engine reads: Snowflake by default
+             (connection PR_GUARDIAN_SNOWFLAKE_CONNECTION), or SQLite with PR_GUARDIAN_DB_BACKEND=sqlite
+  snowflake  straight to PR_GUARDIAN.CORE with trigger/sf.py (for when engine/ isn't checked out)
+  auto       engine if engine/db.py exists, otherwise snowflake. Never both: that would write every row twice.
 
 --dry-run prints what would be written and touches nothing.
 """
@@ -78,7 +81,7 @@ def planted_meta(folder: pathlib.Path) -> dict:
     return dict(line.split(": ", 1) for line in head.splitlines() if ": " in line)
 
 
-def from_planted(name: str, number: int | None, repo: str) -> dict:
+def from_planted(name: str, number: int | None, repo: str, checkout: pathlib.Path | None = None) -> dict:
     folder_name, default_number = PLANTED[name]
     folder = DEMO / "planted-prs" / folder_name
     meta = planted_meta(folder)
@@ -93,6 +96,10 @@ def from_planted(name: str, number: int | None, repo: str) -> dict:
         sh("git", "add", "-A", cwd=work)
         files = [f for f in sh("git", "diff", "--cached", "--name-only", cwd=work).splitlines() if f]
         diff = sh("git", "diff", "--cached", "--no-color", cwd=work)
+        if checkout:
+            if checkout.exists():
+                shutil.rmtree(checkout)
+            shutil.copytree(work, checkout, ignore=shutil.ignore_patterns(".git"))
     return {
         "pr_number": number or default_number,
         "repo": repo,
@@ -113,10 +120,10 @@ def summarize(pr: dict) -> str:
 # --- stores --------------------------------------------------------------------------------
 
 
-class LocalStore:
-    """engine/db.py itself, so the row is exactly what the engine expects to read."""
+class EngineStore:
+    """engine/db.py itself, so the row is exactly what the engine expects to read, in its store."""
 
-    name = "local"
+    name = "engine"
 
     def __init__(self, engine_dir: pathlib.Path):
         sys.path.insert(0, str(engine_dir))
@@ -165,22 +172,20 @@ class SnowflakeStore:
 
 
 def open_stores(choice: str, engine_dir: pathlib.Path, connection: str | None) -> list:
+    has_engine = (engine_dir / "db.py").exists()
+    if choice == "auto":
+        choice = "engine" if has_engine else "snowflake"
+    if choice == "engine":
+        if not has_engine:
+            raise SystemExit(f"--store engine: no db.py in {engine_dir} (pass --engine-dir)")
+        return [EngineStore(engine_dir)]
     sys.path.insert(0, str(HERE))
     import sf
 
-    want_local = choice in ("local", "both") or (choice == "auto" and (engine_dir / "db.py").exists())
-    want_sf = choice in ("snowflake", "both") or (choice == "auto" and sf.configured(connection))
-    if choice in ("local", "both") and not (engine_dir / "db.py").exists():
-        raise SystemExit(f"--store {choice}: no db.py in {engine_dir} (pass --engine-dir)")
-    stores = []
-    if want_local:
-        stores.append(LocalStore(engine_dir))
-    if want_sf:
-        stores.append(SnowflakeStore(connection))
-    if not stores:
+    if not sf.configured(connection):
         raise SystemExit("Nowhere to write: no engine/db.py found and Snowflake isn't configured. "
                          "Use --dry-run, --engine-dir, --connection or SNOWFLAKE_* env vars.")
-    return stores
+    return [SnowflakeStore(connection)]
 
 
 # --- main ----------------------------------------------------------------------------------
@@ -195,7 +200,9 @@ def main(argv=None) -> int:
     ap.add_argument("--pr", type=int)
     ap.add_argument("--planted-repo", default=os.environ.get("PR_REPO", "local/demo-shop"),
                     help="repo name recorded for --planted rows")
-    ap.add_argument("--store", choices=("auto", "local", "snowflake", "both"), default="auto")
+    ap.add_argument("--checkout", type=pathlib.Path,
+                    help="with --planted: also write the PR branch's files here (replaces the folder)")
+    ap.add_argument("--store", choices=("auto", "engine", "snowflake"), default="auto")
     ap.add_argument("--engine-dir", type=pathlib.Path,
                     default=pathlib.Path(os.environ.get("PR_GUARDIAN_ENGINE_DIR", ROOT / "engine")))
     ap.add_argument("--connection", help="snow CLI connection name (laptop)")
@@ -209,7 +216,7 @@ def main(argv=None) -> int:
             ap.error("--repo needs --pr N")
         pr = from_gh(a.repo, a.pr)
     else:
-        pr = from_planted(a.planted, a.pr, a.planted_repo)
+        pr = from_planted(a.planted, a.pr, a.planted_repo, a.checkout)
 
     if len(pr["diff_text"]) > MAX_DIFF_CHARS:
         cut = len(pr["diff_text"]) - MAX_DIFF_CHARS

@@ -51,12 +51,20 @@ pip install pytest
 python demo-data/test_demo_data.py          # 9 checks, all OK
 ```
 
-Judge the planted PRs for real on your laptop (needs `claude` logged in, or `ANTHROPIC_API_KEY`):
+Judge the planted PRs for real on your laptop (needs `claude` logged in, or `ANTHROPIC_API_KEY`).
+No Snowflake needed: the engine can use a local SQLite file. `--checkout` writes the PR's files to a
+folder so the engine can read the whole file and run the tests on its fix:
 ```
-python trigger/send_diff.py --planted violation   # PR_DIFFS row #101 in the engine's local db
-python engine/run.py 101                          # expect fix;      102 -> allow;  103 -> escalate
+export PR_GUARDIAN_DB_BACKEND=sqlite PR_GUARDIAN_TEST_CMD="python3 -m pytest -q"
+python3 trigger/send_diff.py --planted violation --checkout /tmp/shop-101
+PR_GUARDIAN_REPO=/tmp/shop-101 python3 engine/run.py 101     # expect fix, tests_passed
+python3 trigger/send_diff.py --planted decoy --checkout /tmp/shop-102
+PR_GUARDIAN_REPO=/tmp/shop-102 python3 engine/run.py 102     # expect allow
+python3 trigger/send_diff.py --planted ambiguous --checkout /tmp/shop-103
+PR_GUARDIAN_REPO=/tmp/shop-103 python3 engine/run.py 103     # expect escalate
 ```
-These are the same PR numbers as `engine/seed_fake_rows.py`, built from the real files.
+(To use Snowflake instead, drop `PR_GUARDIAN_DB_BACKEND` and set `PR_GUARDIAN_SNOWFLAKE_CONNECTION`
+to your snow connection name.) Same PR numbers as `engine/seed_fake_rows.py`, built from the real files.
 **Phase 3 sign-off is Erik's:** decoy → `allow` citing R2 and ambiguous → `escalate` citing R3,
 twice in a row each, live. If the decoy gets flagged, fix `rules.md` or the prompt, never the PR.
 
@@ -68,13 +76,15 @@ happen to frosty.
 1. `gh auth login`, then from frosty's root:
    `demo-data/make_demo_repo.sh <you>/frosty-demo-shop <kaushik-gh> <rohan-gh> <tejas-gh>`
 2. Leave branch protection on main **off** (reset needs to force-push).
-3. Repo **Variables**: `GUARDIAN_REF` = the frosty branch that has trigger + engine + merge
-   (`main` once everyone's branches are merged in; that's the default).
-4. Snowflake key-pair: `bash trigger/keygen.sh` and run the `ALTER USER` it prints in Snowsight.
-5. Repo **Secrets**: `SNOWFLAKE_ACCOUNT` (`fqwenhp-ec45741`), `SNOWFLAKE_USER`, `SNOWFLAKE_PRIVATE_KEY`,
-   optionally `SNOWFLAKE_ROLE`; **one of** `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`
-   (`claude setup-token`); `SLACK_WEBHOOK_URL` (Tejas).
-6. `demo-data/planted.sh open violation` → Actions tab: step 1 green.
+3. Nothing to set for `GUARDIAN_REF`: it defaults to frosty `main`, which has trigger, engine and merge.
+4. Repo **Secrets** (values per `PROGRESS.md`; Kaushik's key is already registered in Snowflake):
+   `SNOWFLAKE_ACCOUNT` = `FQWENHP-EC45741`, `SNOWFLAKE_USER` = `CHEZZZ439@GMAIL.COM` (the email,
+   not the short name, or the key sign-in fails), `SNOWFLAKE_PRIVATE_KEY` = Kaushik's `rsa_key.p8`
+   with the BEGIN/END lines, `CLAUDE_CODE_OAUTH_TOKEN` = output of `claude setup-token`
+   (do **not** also set `ANTHROPIC_API_KEY`), `SLACK_WEBHOOK_URL` (Tejas).
+   Kaushik pastes the key and token himself if he'd rather not share them.
+   (`trigger/keygen.sh` is only for registering a separate CI key later.)
+5. `demo-data/planted.sh open violation` → Actions tab: all steps green.
 
 ## Between takes
 

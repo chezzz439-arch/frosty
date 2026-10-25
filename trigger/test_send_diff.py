@@ -44,6 +44,14 @@ class Planted(unittest.TestCase):
             self.assertIn("+", send_diff.from_planted(name, 7, "r")["diff_text"])
             self.assertIn("4111111111111111", send_diff.from_planted(name, 7, "r")["diff_text"])
 
+    def test_checkout_writes_the_pr_branch_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "shop-101"
+            send_diff.from_planted("violation", None, "r", out)
+            self.assertIn("card.number)", (out / "checkout/payments.py").read_text())
+            self.assertTrue((out / "tests/test_log_safety.py").exists())
+            self.assertFalse((out / ".git").exists())
+
     def test_violation_diff_contains_the_leak(self):
         diff = send_diff.from_planted("violation", 1, "r")["diff_text"]
         self.assertIn('+    logger.info("Card used: %s", card.number)', diff)
@@ -101,17 +109,28 @@ class Stores(unittest.TestCase):
         self.assertEqual([p[1] for _, p in store.conn.log if "PR_EVENTS" in _], ["pr opened", "diff written"])
         self.assertEqual(store.conn.commits, 1)
 
-    def test_local_store_uses_engine_db_functions(self):
+    def test_engine_store_uses_engine_db_functions(self):
         calls = []
         fake_db = types.SimpleNamespace(
             insert_diff=lambda **kw: calls.append(("diff", kw)),
             log_event=lambda *a: calls.append(("event", a)))
-        store = send_diff.LocalStore.__new__(send_diff.LocalStore)
+        store = send_diff.EngineStore.__new__(send_diff.EngineStore)
         store.db = fake_db
         store.write(self.PR, "1 file(s)")
         self.assertEqual([c[0] for c in calls], ["event", "diff", "event"])
         self.assertEqual(calls[1][1]["files"], ["a.py"])
         self.assertEqual(calls[2][1][1:3], ("diff written", "ok"))
+
+    def test_auto_prefers_engine_and_never_writes_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "db.py").write_text("def insert_diff(**kw): pass\ndef log_event(*a): pass\n")
+            os.environ["SNOWFLAKE_ACCOUNT"] = "x"
+            try:
+                stores = send_diff.open_stores("auto", pathlib.Path(tmp), None)
+            finally:
+                os.environ.pop("SNOWFLAKE_ACCOUNT")
+                sys.modules.pop("db", None)
+            self.assertEqual([s.name for s in stores], ["engine"])
 
     def test_auto_with_nothing_available_exits(self):
         with tempfile.TemporaryDirectory() as tmp:
