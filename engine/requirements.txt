@@ -1,0 +1,2 @@
+anthropic>=0.80.0
+snowflake-connector-python>=3.12.0
