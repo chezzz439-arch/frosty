@@ -22,8 +22,12 @@ import unittest
 _TMP = tempfile.mkdtemp(prefix="pr-guardian-test-")
 os.environ["PR_GUARDIAN_DB"] = os.path.join(_TMP, "test.db")
 
+import shutil  # noqa: E402
+
 import backends  # noqa: E402
 import db  # noqa: E402
+import fixer  # noqa: E402
+import workspace  # noqa: E402
 import judge as judge_mod  # noqa: E402
 from backends import BackendError, CliBackend  # noqa: E402
 from judge import Verdict, build_user_content, judge  # noqa: E402
@@ -517,6 +521,219 @@ class TestJudgeOverTheCli(unittest.TestCase):
         verdict = judge(DIFF, backend=backend, rules="RULE")
         self.assertEqual(verdict.decision, "escalate")
         self.assertIn("nothing to apply", verdict.reason)
+
+
+# --- the sandbox and the self-correcting loop --------------------------------
+
+
+PASSING_TEST = (
+    "import unittest\n"
+    "class T(unittest.TestCase):\n"
+    "    def test_ok(self):\n"
+    "        from app.code import value\n"
+    "        self.assertEqual(value(), 1)\n"
+)
+
+
+def make_repo(root):
+    """A tiny repo whose suite passes."""
+    os.makedirs(os.path.join(root, "app"), exist_ok=True)
+    os.makedirs(os.path.join(root, "tests"), exist_ok=True)
+    for path, text in (
+        ("app/__init__.py", ""),
+        ("app/code.py", "def value():\n    return 1\n"),
+        ("tests/__init__.py", ""),
+        ("tests/test_code.py", PASSING_TEST),
+    ):
+        with open(os.path.join(root, path), "w", encoding="utf-8") as handle:
+            handle.write(text)
+    return root
+
+
+class TestWorkspace(unittest.TestCase):
+    def setUp(self):
+        self.root = make_repo(tempfile.mkdtemp(prefix="pr-guardian-repo-"))
+
+    def test_read_sources_returns_whole_files(self):
+        sources = workspace.read_sources(self.root, ["app/code.py"])
+        self.assertEqual(sources[0]["path"], "app/code.py")
+        self.assertIn("return 1", sources[0]["content"])
+
+    def test_an_unreadable_file_is_reported_not_silently_dropped(self):
+        # The judge must not be left to assume a missing file was empty.
+        sources = workspace.read_sources(self.root, ["app/code.py", "gone.py"])
+        self.assertEqual(len(sources), 2)
+        self.assertIsNone(sources[1]["content"])
+
+    def test_a_path_escaping_the_repo_is_refused(self):
+        # fixed_code paths come from a model reading an attacker-controlled diff.
+        for escape in ("../outside.py", "app/../../outside.py", "/etc/passwd"):
+            with self.assertRaises(workspace.UnsafePath):
+                workspace.apply_fix(self.root, [{"path": escape, "content": "x"}])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "..", "outside.py")))
+
+    def test_the_sandbox_is_a_copy_and_the_real_checkout_is_untouched(self):
+        sandbox = workspace.copy_repo(self.root)
+        try:
+            workspace.apply_fix(sandbox, [{"path": "app/code.py", "content": "BROKEN"}])
+            with open(os.path.join(self.root, "app/code.py"), encoding="utf-8") as f:
+                self.assertIn("return 1", f.read())
+        finally:
+            shutil.rmtree(os.path.dirname(sandbox), ignore_errors=True)
+
+    def test_run_tests_reports_green_and_red(self):
+        sandbox = workspace.copy_repo(self.root)
+        try:
+            passed, _ = workspace.run_tests(sandbox)
+            self.assertTrue(passed)
+            workspace.apply_fix(
+                sandbox, [{"path": "app/code.py", "content": "def value():\n    return 2\n"}]
+            )
+            passed, output = workspace.run_tests(sandbox)
+            self.assertFalse(passed)
+            self.assertIn("FAILED", output)
+        finally:
+            shutil.rmtree(os.path.dirname(sandbox), ignore_errors=True)
+
+
+class ScriptedBackend:
+    """Returns a queued verdict payload per call, recording the prompts."""
+
+    name = "scripted"
+
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.prompts = []
+
+    def complete(self, system, user, schema, model):
+        self.prompts.append(user)
+        return self.payloads.pop(0)
+
+
+GOOD = "def value():\n    return 1\n"
+BAD = "def value():\n    return 99\n"
+
+
+def payload(content, decision="fix", path="app/code.py"):
+    return {
+        "decision": decision,
+        "confidence": 0.9,
+        "reason": "logs a card number",
+        "fixed_code": [{"path": path, "content": content}] if decision == "fix" else [],
+    }
+
+
+class TestFixLoop(unittest.TestCase):
+    def setUp(self):
+        reset_db()
+        self.root = make_repo(tempfile.mkdtemp(prefix="pr-guardian-repo-"))
+        self.diff = dict(DIFF, files=["app/code.py"])
+
+    def loop(self, payloads, first=None):
+        backend = ScriptedBackend(payloads)
+        verdict = judge_mod._coerce(first or payload(GOOD))
+        return backend, fixer.run_fix_loop(
+            self.diff, verdict, backend=backend, root=self.root
+        )
+
+    def steps(self):
+        return [(e["step"], e["status"]) for e in db.events(101)]
+
+    def test_a_fix_that_passes_first_time(self):
+        _, outcome = self.loop([])
+        self.assertEqual(outcome.verdict.decision, "fix")
+        self.assertIs(outcome.tests_passed, True)
+        self.assertEqual(outcome.attempts, 1)
+        self.assertIn(("fix attempt 1", "ok"), self.steps())
+        self.assertIn(("tests passed", "ok"), self.steps())
+
+    def test_a_failing_fix_is_retried_and_can_recover(self):
+        _, outcome = self.loop([payload(GOOD)], first=payload(BAD))
+        self.assertEqual(outcome.verdict.decision, "fix")
+        self.assertIs(outcome.tests_passed, True)
+        self.assertEqual(outcome.attempts, 2)
+        self.assertIn(("fix attempt 1", "failed"), self.steps())
+        self.assertIn(("fix attempt 2", "ok"), self.steps())
+
+    def test_the_test_failure_is_fed_back_to_the_judge(self):
+        backend, _ = self.loop([payload(GOOD)], first=payload(BAD))
+        retry_prompt = backend.prompts[0]
+        self.assertIn("FAILED", retry_prompt)
+        self.assertIn("Attempt 1", retry_prompt)
+        self.assertIn("app/code.py", retry_prompt)
+
+    def test_three_failures_become_an_escalation_that_cannot_merge(self):
+        _, outcome = self.loop(
+            [payload(BAD), payload(BAD)], first=payload(BAD)
+        )
+        self.assertEqual(outcome.verdict.decision, "escalate")
+        self.assertIs(outcome.tests_passed, False)
+        self.assertEqual(outcome.attempts, 3)
+        # /merge gates on "fix AND tests_passed"; escalate never merges.
+        self.assertIn(("fix attempt 3", "failed"), self.steps())
+        self.assertIn(("tests passed", "failed"), self.steps())
+
+    def test_failed_fixes_are_not_carried_into_the_verdict(self):
+        # A VERDICTS row holding code that failed its tests invites someone to
+        # apply it anyway.
+        _, outcome = self.loop([payload(BAD), payload(BAD)], first=payload(BAD))
+        self.assertEqual(outcome.verdict.fixed_code, [])
+
+    def test_it_never_tries_a_fourth_time(self):
+        backend, outcome = self.loop([payload(BAD), payload(BAD)], first=payload(BAD))
+        # Two retries after the first attempt, then it stops.
+        self.assertEqual(len(backend.prompts), 2)
+        self.assertEqual(outcome.attempts, 3)
+
+    def test_the_judge_backing_off_mid_loop_is_respected(self):
+        _, outcome = self.loop(
+            [payload("", decision="escalate")], first=payload(BAD)
+        )
+        self.assertEqual(outcome.verdict.decision, "escalate")
+        self.assertIs(outcome.tests_passed, False)
+        self.assertEqual(outcome.attempts, 1)
+
+    def test_an_unplaceable_fix_escalates_without_being_tested(self):
+        _, outcome = self.loop([], first=payload(GOOD, path="../escape.py"))
+        self.assertEqual(outcome.verdict.decision, "escalate")
+        self.assertIsNone(outcome.tests_passed)
+        self.assertIn(("fix attempt 1", "failed"), self.steps())
+
+    def test_every_attempt_writes_an_event_for_the_dashboard(self):
+        # Each attempt logs "running" and then its outcome, so the dashboard
+        # can show a step in flight rather than jumping from nothing to done.
+        self.loop([payload(BAD), payload(BAD)], first=payload(BAD))
+        attempts = [s for s in self.steps() if s[0].startswith("fix attempt")]
+        self.assertEqual(attempts, [
+            ("fix attempt 1", "running"), ("fix attempt 1", "failed"),
+            ("fix attempt 2", "running"), ("fix attempt 2", "failed"),
+            ("fix attempt 3", "running"), ("fix attempt 3", "failed"),
+        ])
+
+    def test_the_real_checkout_is_never_written_to(self):
+        self.loop([payload(BAD), payload(BAD)], first=payload(BAD))
+        with open(os.path.join(self.root, "app/code.py"), encoding="utf-8") as handle:
+            self.assertIn("return 1", handle.read())
+
+
+class TestFullFileLoading(unittest.TestCase):
+    def test_file_contents_reach_the_prompt(self):
+        content = build_user_content(
+            DIFF, "RULE", [], sources=[{"path": "a.py", "content": "WHOLE FILE"}]
+        )
+        self.assertIn("WHOLE FILE", content)
+        self.assertIn("complete new text", content)
+
+    def test_an_unreadable_file_is_declared_in_the_prompt(self):
+        content = build_user_content(
+            DIFF, "RULE", [], sources=[{"path": "a.py", "content": None}]
+        )
+        self.assertIn("not readable", content)
+
+    def test_the_ambiguity_rules_are_in_the_fallback(self):
+        # Until demo-data/rules.md lands, these are what make #103 escalate.
+        self.assertIn("escalate unless clearly safe", judge_mod.FALLBACK_RULES)
+        self.assertIn("breaks behavior", judge_mod.FALLBACK_RULES)
 
 
 class TestBackendSelection(unittest.TestCase):

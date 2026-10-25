@@ -18,7 +18,9 @@ from __future__ import annotations
 import sys
 
 import db
+import workspace
 from backends import build_backend
+from fixer import run_fix_loop
 from judge import judge
 
 
@@ -86,6 +88,20 @@ def main(argv: list[str]) -> int:
         f"{len(diff['files'])} file(s), {len(diff['diff_text'] or '')} chars",
     )
 
+    # The judge is asked for COMPLETE corrected files, so it has to be given
+    # the complete current ones. With only a diff hunk it can't honestly
+    # produce a whole file and correctly escalates instead.
+    root = workspace.repo_root()
+    sources = workspace.read_sources(root, diff["files"])
+    unreadable = [s["path"] for s in sources if s["content"] is None]
+    db.log_event(
+        pr_number,
+        "files read",
+        "failed" if unreadable else "ok",
+        f"{len(sources) - len(unreadable)}/{len(sources)} file(s) from {root}"
+        + (f"; could not read {', '.join(unreadable)}" if unreadable else ""),
+    )
+
     receipts = db.recent_receipts(limit=10)
     db.log_event(
         pr_number,
@@ -94,7 +110,25 @@ def main(argv: list[str]) -> int:
         f"{backend.name} backend, memory: {len(receipts)} receipt(s)",
     )
 
-    verdict = judge(diff, backend=backend, receipts=receipts)
+    verdict = judge(diff, backend=backend, receipts=receipts, sources=sources)
+
+    detail = f"{verdict.decision} (confidence {verdict.confidence:.2f})"
+    if verdict.is_fix:
+        detail += f", rewrote {', '.join(verdict.changed_paths)}"
+    db.log_event(pr_number, "decision made", "ok", detail)
+
+    # Only a 'fix' touches the code, so only a 'fix' has anything to prove.
+    # allow/escalate leave tests_passed NULL: "not run", not "failed".
+    tests_passed, attempts = None, 0
+    if verdict.is_fix:
+        outcome = run_fix_loop(
+            diff, verdict, backend=backend, receipts=receipts, root=root
+        )
+        verdict, tests_passed, attempts = (
+            outcome.verdict,
+            outcome.tests_passed,
+            outcome.attempts,
+        )
 
     db.write_verdict(
         pr_number=pr_number,
@@ -102,18 +136,13 @@ def main(argv: list[str]) -> int:
         confidence=verdict.confidence,
         reason=verdict.reason,
         fixed_code=verdict.fixed_code,
-        # The test harness isn't built yet, so nothing has been verified.
-        # NULL (not False) means "not run" -- /merge's gate refuses either way.
-        tests_passed=None,
-        attempts=0,
+        tests_passed=tests_passed,
+        attempts=attempts,
     )
 
-    detail = f"{verdict.decision} (confidence {verdict.confidence:.2f})"
-    if verdict.is_fix:
-        detail += f", rewrote {', '.join(verdict.changed_paths)}"
-    db.log_event(pr_number, "decision made", "ok", detail)
-
     print(f"PR #{pr_number}: {verdict.decision} (confidence {verdict.confidence:.2f})")
+    if attempts:
+        print(f"  tests_passed={tests_passed} after {attempts} attempt(s)")
     print(verdict.reason)
     for changed in verdict.fixed_code:
         print(f"  rewrote {changed['path']} ({len(changed['content'])} chars)")

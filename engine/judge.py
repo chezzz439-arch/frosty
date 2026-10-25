@@ -44,6 +44,9 @@ FALLBACK_RULES = """\
    bank account number to logs, stdout, or an error message.
 2. Never commit a credential: API key, password, private key, or token.
 3. Never disable TLS verification or certificate checking.
+4. Changes to error handling (catching and ignoring exceptions), timeouts,
+   retries or rate limits are judgment calls: escalate unless clearly safe.
+5. When unsure whether a change breaks behavior, escalate.
 """
 
 # The response shape. Note the schema carries no numeric bounds on confidence:
@@ -191,11 +194,47 @@ def _format_memory(receipts: list[dict]) -> str:
     )
 
 
-def build_user_content(diff: dict, rules: str, receipts: list[dict]) -> str:
-    """Assemble the user turn: rules, memory, then the diff itself.
+def _format_sources(sources: list[dict]) -> str:
+    """The full current contents of every file the PR touches.
 
-    The diff goes last so the model reads the standard it's judging against
-    before the thing being judged.
+    Without this the judge only sees a diff hunk, and the schema asks it for
+    the COMPLETE corrected file. It can't honestly produce one it has never
+    read, so it escalates -- which is the right call, and the reason the
+    violation PR never came back as a fix until this was added.
+    """
+    if not sources:
+        return ""
+
+    blocks = []
+    for source in sources:
+        path = source.get("path")
+        content = source.get("content")
+        if content is None:
+            # The trigger listed a file we couldn't read: deleted by the PR, or
+            # a path that doesn't exist on the branch. Say so rather than let
+            # the model assume the file is empty.
+            blocks.append(f"{path}: (not readable on this branch)")
+            continue
+        blocks.append(f"`{path}`, in full:\n\n```\n{content}\n```")
+
+    return (
+        "The current contents of every file this PR touches, as they are on "
+        "the branch. If you choose 'fix', return the complete new text of the "
+        "file(s) you change, based on these:\n\n" + "\n\n".join(blocks)
+    )
+
+
+def build_user_content(
+    diff: dict,
+    rules: str,
+    receipts: list[dict],
+    sources: list[dict] | None = None,
+    feedback: str | None = None,
+) -> str:
+    """Assemble the user turn: rules, memory, file contents, then the diff.
+
+    The diff goes last so the model reads the standard it's judging against,
+    and the code it's judging, before the change itself.
     """
     files = diff.get("files") or []
     file_list = "\n".join(f"- {name}" for name in files) or "- (none listed)"
@@ -208,16 +247,31 @@ def build_user_content(diff: dict, rules: str, receipts: list[dict]) -> str:
     if memory:
         parts.append(memory)
 
+    source_text = _format_sources(sources or [])
+    if source_text:
+        parts.append(source_text)
+
     parts.append(
         f"Pull request #{diff.get('pr_number')} on {diff.get('repo')}, "
         f"branch {diff.get('branch')}.\n\n"
         f"Files changed:\n{file_list}\n\n"
         f"The diff:\n\n```diff\n{diff.get('diff_text', '')}\n```"
     )
-    parts.append(
-        "Judge this diff. Pay attention to which file each change is in before "
-        "you decide."
-    )
+
+    if feedback:
+        # A retry. The model's previous fix broke the suite, so the failure is
+        # the most important thing in the prompt and goes closest to the ask.
+        parts.append(feedback)
+        parts.append(
+            "Return a corrected complete file that both fixes the original "
+            "violation and passes the test suite. If you cannot see how to "
+            "satisfy both, choose 'escalate' and say what is in the way."
+        )
+    else:
+        parts.append(
+            "Judge this diff. Pay attention to which file each change is in "
+            "before you decide."
+        )
 
     return "\n\n---\n\n".join(parts)
 
@@ -287,6 +341,8 @@ def judge(
     receipts: list[dict] | None = None,
     model: str | None = None,
     client: Any | None = None,
+    sources: list[dict] | None = None,
+    feedback: str | None = None,
 ) -> Verdict:
     """Judge one diff. Never raises: any failure becomes an escalation.
 
@@ -307,7 +363,7 @@ def judge(
 
     model = model or os.environ.get("PR_GUARDIAN_MODEL") or DEFAULT_MODEL
     rules = rules if rules is not None else load_rules()
-    content = build_user_content(diff, rules, receipts or [])
+    content = build_user_content(diff, rules, receipts or [], sources, feedback)
 
     try:
         payload = backend.complete(
