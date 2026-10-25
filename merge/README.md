@@ -1,46 +1,27 @@
-# /merge — Tejas
+# Tejas: PR Guardian merge component
 
-Pushes the fix, merges or labels, posts the receipt comment, pings Slack,
-writes `RECEIPTS`.
+## Setup
 
-## The gate (from CLAUDE.md)
+Install dependencies: `pip install -r merge/requirements.txt`
 
-Read the newest `VERDICTS` row for the PR, then:
+GitHub Actions secrets: `GITHUB_TOKEN` (Actions token with `contents: write`, `pull-requests: write`, `issues: write`), `SLACK_WEBHOOK_URL`, `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD`, `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_WAREHOUSE`.
 
-**Merge only if** `decision` is `allow`, **or** `decision` is `fix` **and**
-`tests_passed` is true.
+Run after Kaushik writes a VERDICTS row:
 
-Otherwise — including `escalate`, and including a `fix` whose tests did not
-pass — label `needs-human` and **do not merge**.
+`python merge/run.py 12`
 
-`tests_passed` is three-valued on purpose:
+Dry run (reads Snowflake, no GitHub writes): `GUARDIAN_DRY_RUN=1 python merge/run.py 12`
 
-| Value | Meaning |
-| --- | --- |
-| `true` | the engine applied the fix and the suite passed |
-| `false` | the engine applied the fix and the suite failed |
-| `NULL` | not run |
+## Engine handoff contract
 
-`NULL` is not `false`. Both refuse the merge, but only `false` means a fix was
-actually attempted and failed.
+`VERDICTS.fixed_code` must be JSON with `{"files":[{"path":"app/example.py","content":"complete corrected file contents"}]}`. Agree on this format with Kaushik. `tests_passed` must be a Snowflake BOOLEAN and `decision` one of `fix`, `allow`, `escalate`.
 
-## What you write
+## Important safety / integration requirements
 
-`RECEIPTS`: `pr_number`, `decision`, `reason`, `merged`, `receipt_url`.
-
-The engine reads this back as its memory — a lookup over recent `RECEIPTS` goes
-into the Claude prompt, so past decisions keep future ones consistent. Write an
-honest `reason`; it is what Claude sees next time.
-
-Plus one `PR_EVENTS` row per step (`merged`, etc.).
-
-Exact DDL: `sql/setup.sql`. Don't change a table without telling the team.
-
-## Secrets
-
-`GITHUB_TOKEN`, `SLACK_WEBHOOK_URL`, Snowflake connection details. Never committed.
-
-## Status
-
-Not started. The engine already writes `VERDICTS` rows you can read today —
-run `python engine/run.py 101` after `python engine/seed_fake_rows.py`.
+- Do **not** use this on production repositories without additional safeguards. The prototype assumes a trusted hackathon demo repository.
+- The current schema does not bind a verdict to the exact PR head SHA. Add `head_sha` to VERDICTS (coordinate with Kaushik), compare it with the current PR head before every merge, and prevent old verdicts being reused.
+- Fixes create a **new commit**. Require GitHub branch protection checks on that new commit before merging. GitHub may reject merge while checks are pending; rerun the merge step only after checks pass.
+- Do not enable the Action on untrusted fork code with write credentials. Use least-privilege GitHub Actions permissions.
+- Retry and idempotency handling are needed before running the Action on repeated pull_request events. Avoid duplicate comments/notifications/receipts.
+- If Slack fails after merging, the run fails but the merge is not rolled back. The stored receipt remains and Slack can be retried manually.
+- Configure GitHub Actions `permissions: contents: write`, `pull-requests: write`, `issues: write` and repository Actions settings to allow PR merges. Branch rules may prevent automated merging.
