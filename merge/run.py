@@ -110,6 +110,31 @@ def decode_files(raw):
     return files
 
 
+def merge_pr(pr, attempts=10, pause=3):
+    """Squash-merge, waiting for GitHub to work out whether it can.
+
+    Right after push_fix lands a commit, `mergeable` is null while GitHub
+    recomputes it, and the merge endpoint answers 405 Method Not Allowed. That
+    is "ask again in a moment", not "refused" -- it failed the first live run
+    this way. Anything other than 405 still raises straight away, so a genuine
+    refusal (conflict, closed PR, protected branch) is not retried into a loop.
+    """
+    for attempt in range(attempts):
+        info = github('GET', f'/pulls/{pr}')
+        if info['mergeable'] is None:
+            time.sleep(pause)
+            continue
+        if not info['mergeable']:
+            raise RuntimeError(f"PR #{pr} is not mergeable: {info.get('mergeable_state')}")
+        try:
+            return github('PUT', f'/pulls/{pr}/merge', json={'merge_method': 'squash'})
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 405 or attempt == attempts - 1:
+                raise
+            time.sleep(pause)
+    raise RuntimeError(f'PR #{pr}: GitHub never reported a mergeable state')
+
+
 def push_fix(pr, files):
     """Update the PR's own branch using the GitHub Git Data API; reject forks."""
     info = github('GET', f'/pulls/{pr}')
@@ -193,11 +218,11 @@ def process(pr):
             event(db, pr, 'fix pushed', 'ok', changed)
             # ASSUMPTION: required branch checks enforce tests for this new commit.
             # GitHub merge API may refuse while checks are pending; fail closed.
-            github('PUT', f'/pulls/{pr}/merge', json={'merge_method':'squash'})
+            merge_pr(pr)
             merged = True
             event(db, pr, 'merged', 'ok', 'Tested fix merged')
         elif decision == 'allow':
-            github('PUT', f'/pulls/{pr}/merge', json={'merge_method':'squash'})
+            merge_pr(pr)
             merged = True
             event(db, pr, 'merged', 'ok', 'Allowed as-is')
         else:
