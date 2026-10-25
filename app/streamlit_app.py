@@ -255,7 +255,7 @@ def main():
         st.sidebar.caption("Demo data lives only in this viewer session. Use Manual backup to replay a scenario.")
     else:
         st.info("TEAM DATA — reads the selected Snowflake tables. Connection errors never switch you to fake data.")
-        raw_prefix = st.sidebar.text_input("Team database.schema", os.getenv("GUARDIAN_TABLE_PREFIX", "PR_GUARDIAN.APP"))
+        raw_prefix = st.sidebar.text_input("Team database.schema", os.getenv("GUARDIAN_TABLE_PREFIX", "PR_GUARDIAN.CORE"))
         try:
             prefix = qualified_prefix(raw_prefix)
             team_repo = st.sidebar.text_input("GitHub repository", os.getenv("GUARDIAN_REPO", "chezzz439-arch/frosty"))
