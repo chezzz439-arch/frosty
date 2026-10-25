@@ -18,10 +18,19 @@ import subprocess
 import sys
 import tempfile
 
-# ASSUMPTION: the Action runs the engine from the root of the checked-out PR
-# branch. Override with PR_GUARDIAN_REPO.
 def repo_root() -> str:
-    return os.path.abspath(os.environ.get("PR_GUARDIAN_REPO") or os.getcwd())
+    """The checked-out PR branch: the tree to read, sandbox and test.
+
+    PR_GUARDIAN_REPO_DIR is the name trigger/guardian.yml sets. It checks the
+    PR out into repo/ alongside guardian/, so the working directory is the
+    workspace root and NOT the tree being judged -- falling back to cwd there
+    would sandbox both checkouts and run the wrong test suite. Both names are
+    accepted so neither side has to change.
+    """
+    override = os.environ.get("PR_GUARDIAN_REPO") or os.environ.get(
+        "PR_GUARDIAN_REPO_DIR"
+    )
+    return os.path.abspath(override or os.getcwd())
 
 
 # ASSUMPTION: /demo-data's suite is runnable with stdlib unittest discovery.

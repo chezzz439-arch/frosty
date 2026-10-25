@@ -21,7 +21,7 @@ import db
 import workspace
 from backends import build_backend
 from fixer import run_fix_loop
-from judge import judge
+from judge import judge, load_rules
 
 
 def show(pr_number: int) -> int:
@@ -102,6 +102,21 @@ def main(argv: list[str]) -> int:
         + (f"; could not read {', '.join(unreadable)}" if unreadable else ""),
     )
 
+    # Loaded once and passed down, so a retry can't silently judge against
+    # different rules than the first attempt did.
+    rules, rules_source = load_rules()
+    db.log_event(
+        pr_number,
+        "rules loaded",
+        "failed" if rules_source == "built-in" else "ok",
+        f"{len(rules)} chars from {rules_source}"
+        + (
+            "; the rules file was missing, so verdicts may differ"
+            if rules_source == "built-in"
+            else ""
+        ),
+    )
+
     receipts = db.recent_receipts(limit=10)
     db.log_event(
         pr_number,
@@ -110,7 +125,9 @@ def main(argv: list[str]) -> int:
         f"{backend.name} backend, memory: {len(receipts)} receipt(s)",
     )
 
-    verdict = judge(diff, backend=backend, receipts=receipts, sources=sources)
+    verdict = judge(
+        diff, backend=backend, rules=rules, receipts=receipts, sources=sources
+    )
 
     detail = f"{verdict.decision} (confidence {verdict.confidence:.2f})"
     if verdict.is_fix:
@@ -122,7 +139,7 @@ def main(argv: list[str]) -> int:
     tests_passed, attempts = None, 0
     if verdict.is_fix:
         outcome = run_fix_loop(
-            diff, verdict, backend=backend, receipts=receipts, root=root
+            diff, verdict, backend=backend, rules=rules, receipts=receipts, root=root
         )
         verdict, tests_passed, attempts = (
             outcome.verdict,

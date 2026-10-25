@@ -158,15 +158,31 @@ class Verdict:
         return [f["path"] for f in self.fixed_code]
 
 
-def load_rules(path: str | None = None) -> str:
-    """Read the rules file, falling back to FALLBACK_RULES if it isn't there."""
-    path = path or os.environ.get("PR_GUARDIAN_RULES") or DEFAULT_RULES_PATH
+def rules_path(path: str | None = None) -> str:
+    """Where the rules are read from. PR_GUARDIAN_RULES is what the Action sets.
+
+    The Action points this into its own checkout of frosty, never into the PR:
+    a pull request must not be able to edit the rules it is judged by.
+    """
+    return path or os.environ.get("PR_GUARDIAN_RULES") or DEFAULT_RULES_PATH
+
+
+def load_rules(path: str | None = None) -> tuple[str, str]:
+    """The rules, and where they came from.
+
+    Returns (text, source) where source is the file path, or "built-in" when
+    the file was missing or empty. The caller logs that: FALLBACK_RULES is
+    four lines against Erik's five numbered rules, and silently falling back
+    would change verdicts -- PR 103 escalates because of a rule that only
+    exists in the file -- with nothing on the dashboard to explain why.
+    """
+    path = rules_path(path)
     try:
         with open(path, encoding="utf-8") as handle:
             text = handle.read().strip()
     except OSError:
-        return FALLBACK_RULES
-    return text or FALLBACK_RULES
+        return FALLBACK_RULES, "built-in"
+    return (text, path) if text else (FALLBACK_RULES, "built-in")
 
 
 def _format_memory(receipts: list[dict]) -> str:
@@ -362,7 +378,7 @@ def judge(
         backend = ApiBackend(client)
 
     model = model or os.environ.get("PR_GUARDIAN_MODEL") or DEFAULT_MODEL
-    rules = rules if rules is not None else load_rules()
+    rules = rules if rules is not None else load_rules()[0]
     content = build_user_content(diff, rules, receipts or [], sources, feedback)
 
     try:

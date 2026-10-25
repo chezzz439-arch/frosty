@@ -195,14 +195,39 @@ class TestPrompt(unittest.TestCase):
         self.assertLess(len(content), 2000)
 
     def test_load_rules_falls_back_when_demo_data_is_missing(self):
-        rules = judge_mod.load_rules(os.path.join(_TMP, "nope.md"))
+        rules, source = judge_mod.load_rules(os.path.join(_TMP, "nope.md"))
         self.assertEqual(rules, judge_mod.FALLBACK_RULES)
+        # run.py logs this as a failed step: the fallback is thinner than the
+        # real file and changes verdicts, so it must not pass silently.
+        self.assertEqual(source, "built-in")
 
     def test_load_rules_reads_the_file_when_it_exists(self):
         path = os.path.join(_TMP, "rules.md")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("1. No secrets in logs.\n")
-        self.assertEqual(judge_mod.load_rules(path), "1. No secrets in logs.")
+        self.assertEqual(judge_mod.load_rules(path), ("1. No secrets in logs.", path))
+
+    def test_an_empty_rules_file_counts_as_missing(self):
+        path = os.path.join(_TMP, "empty-rules.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("   \n")
+        self.assertEqual(judge_mod.load_rules(path)[1], "built-in")
+
+    def test_the_action_can_point_the_rules_somewhere_else(self):
+        # trigger/guardian.yml sets PR_GUARDIAN_RULES into its own checkout of
+        # frosty, so a PR cannot edit the rules it is judged by.
+        path = os.path.join(_TMP, "trusted-rules.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("R1 - trusted.\n")
+        saved = os.environ.get("PR_GUARDIAN_RULES")
+        os.environ["PR_GUARDIAN_RULES"] = path
+        try:
+            self.assertEqual(judge_mod.load_rules(), ("R1 - trusted.", path))
+        finally:
+            if saved is None:
+                os.environ.pop("PR_GUARDIAN_RULES", None)
+            else:
+                os.environ["PR_GUARDIAN_RULES"] = saved
 
 
 class TestJudge(unittest.TestCase):
@@ -554,6 +579,45 @@ def make_repo(root):
         with open(os.path.join(root, path), "w", encoding="utf-8") as handle:
             handle.write(text)
     return root
+
+
+class TestRepoRoot(unittest.TestCase):
+    """Which tree the engine reads, sandboxes and tests.
+
+    trigger/guardian.yml checks the PR out into repo/ next to guardian/, so
+    the working directory is the workspace root rather than the tree under
+    review. Getting this wrong is silent: the engine would copy both
+    checkouts and run the wrong test suite.
+    """
+
+    def setUp(self):
+        self._saved = {
+            name: os.environ.pop(name, None)
+            for name in ("PR_GUARDIAN_REPO", "PR_GUARDIAN_REPO_DIR")
+        }
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def test_defaults_to_the_working_directory(self):
+        self.assertEqual(workspace.repo_root(), os.path.abspath(os.getcwd()))
+
+    def test_accepts_the_name_the_action_sets(self):
+        os.environ["PR_GUARDIAN_REPO_DIR"] = _TMP
+        self.assertEqual(workspace.repo_root(), os.path.abspath(_TMP))
+
+    def test_accepts_the_engines_own_name(self):
+        os.environ["PR_GUARDIAN_REPO"] = _TMP
+        self.assertEqual(workspace.repo_root(), os.path.abspath(_TMP))
+
+    def test_the_engines_own_name_wins_when_both_are_set(self):
+        os.environ["PR_GUARDIAN_REPO"] = _TMP
+        os.environ["PR_GUARDIAN_REPO_DIR"] = os.path.join(_TMP, "other")
+        self.assertEqual(workspace.repo_root(), os.path.abspath(_TMP))
 
 
 class TestWorkspace(unittest.TestCase):
