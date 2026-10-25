@@ -1,11 +1,11 @@
-"""Tests for engine/db.py and engine/judge.py.
+"""Tests for engine/db.py, engine/judge.py and engine/backends.py.
 
     python engine/test_judge.py
 
-No API key and no network: the judge takes its client as an argument, so these
-pass a fake that returns canned responses. That covers the plumbing and the
+No API key, no CLI, no network: the judge takes its backend as an argument, so
+these pass fakes that return canned responses. That covers the plumbing and the
 fail-safe paths. It does NOT check that the real model rules correctly on the
-three planted PRs -- that needs a key and a live call.
+three planted PRs -- that needs a live call.
 
 stdlib unittest, not pytest, so the engine's own tests add no dependency.
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 
@@ -21,8 +22,10 @@ import unittest
 _TMP = tempfile.mkdtemp(prefix="pr-guardian-test-")
 os.environ["PR_GUARDIAN_DB"] = os.path.join(_TMP, "test.db")
 
+import backends  # noqa: E402
 import db  # noqa: E402
 import judge as judge_mod  # noqa: E402
+from backends import BackendError, CliBackend  # noqa: E402
 from judge import Verdict, build_user_content, judge  # noqa: E402
 
 
@@ -312,6 +315,242 @@ class TestJudge(unittest.TestCase):
                 verdict.fixed_code,
             )
         self.assertEqual(len(db.verdicts(101)), 4)
+
+
+# --- the claude -p backend ---------------------------------------------------
+
+
+def cli_result(stdout="", stderr="", returncode=0):
+    return subprocess.CompletedProcess(
+        args=["claude"], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def envelope(**fields):
+    """A CLI result envelope, shaped like the real one."""
+    base = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "Allowed.",
+        "session_id": "abc",
+        "total_cost_usd": 0.01,
+    }
+    base.update(fields)
+    return json.dumps(base)
+
+
+VERDICT_PAYLOAD = {
+    "decision": "allow",
+    "confidence": 0.9,
+    "reason": "Test fixture.",
+    "fixed_code": [],
+}
+
+
+class FakeCliBackend(CliBackend):
+    """CliBackend with the subprocess call swapped out, so the flag-building
+    and envelope-reading logic is tested without invoking the real CLI."""
+
+    def __init__(self, completed):
+        super().__init__(binary="claude", timeout=30)
+        self.completed = completed
+        self.argv_used = None
+        self.stdin_used = None
+
+    def complete(self, system, user, schema, model):
+        self.argv_used = self.argv(system, schema, model)
+        self.stdin_used = user
+        return backends._parse_cli_output(self.completed)
+
+
+class TestCliBackendFlags(unittest.TestCase):
+    def argv(self):
+        return CliBackend(binary="claude").argv(
+            "SYSTEM", judge_mod.VERDICT_SCHEMA, "claude-opus-4-8"
+        )
+
+    def test_asks_for_json_and_pins_the_schema(self):
+        argv = self.argv()
+        self.assertEqual(argv[:3], ["claude", "-p", backends.CLI_PROMPT])
+        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+        sent = json.loads(argv[argv.index("--json-schema") + 1])
+        self.assertEqual(sent, judge_mod.VERDICT_SCHEMA)
+
+    def test_passes_the_system_prompt_and_model_through(self):
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--system-prompt") + 1], "SYSTEM")
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-4-8")
+
+    def test_the_judge_gets_no_tools_and_cannot_block_on_a_prompt(self):
+        # A diff is attacker-controlled text; the judge only has to read it.
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("--disable-slash-commands", argv)
+
+    def test_does_not_use_bare_mode(self):
+        # --bare never reads OAuth or CLAUDE_CODE_OAUTH_TOKEN, which is the one
+        # thing this backend exists for.
+        self.assertNotIn("--bare", self.argv())
+
+    def test_leaves_room_for_the_structured_output_turn(self):
+        # A verdict takes two turns: the answer, then the structured output.
+        argv = self.argv()
+        self.assertGreaterEqual(int(argv[argv.index("--max-turns") + 1]), 4)
+
+    def test_runs_outside_the_repo_being_judged(self):
+        # Without --bare the CLI reads the working directory's CLAUDE.md,
+        # hooks and .mcp.json. Those must not come from the branch under review,
+        # so the subprocess runs in a scratch directory instead.
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(kwargs)
+            seen["argv"] = argv
+            return cli_result(envelope(structured_output=VERDICT_PAYLOAD))
+
+        original = backends.subprocess.run
+        backends.subprocess.run = fake_run
+        try:
+            CliBackend().complete("SYS", "USER", judge_mod.VERDICT_SCHEMA, "m")
+        finally:
+            backends.subprocess.run = original
+
+        cwd = seen["cwd"]
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(backends.__file__)))
+        self.assertTrue(os.path.isabs(cwd))
+        self.assertFalse(os.path.abspath(cwd).startswith(repo))
+        # And the content really went to stdin, not the argument list.
+        self.assertEqual(seen["input"], "USER")
+
+
+class TestCliBackendOutput(unittest.TestCase):
+    def parse(self, completed):
+        return backends._parse_cli_output(completed)
+
+    def test_reads_the_structured_verdict(self):
+        payload = self.parse(cli_result(envelope(structured_output=VERDICT_PAYLOAD)))
+        self.assertEqual(payload, VERDICT_PAYLOAD)
+
+    def test_missing_structured_output_is_an_error_not_a_guess(self):
+        # Documented: the field is absent when the run produced no valid
+        # structured output. Never fall back to parsing the prose `result`.
+        with self.assertRaises(BackendError):
+            self.parse(cli_result(envelope()))
+
+    def test_an_in_run_failure_is_detected_even_though_the_exit_code_is_zero(self):
+        # The CLI reports a missing login as is_error on a clean exit.
+        with self.assertRaises(BackendError) as caught:
+            self.parse(cli_result(envelope(
+                is_error=True,
+                subtype="error_during_execution",
+                result="Invalid API key · Please run /login",
+            )))
+        message = str(caught.exception)
+        self.assertIn("error_during_execution", message)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", message)
+
+    def test_max_turns_is_reported_as_a_failure(self):
+        with self.assertRaises(BackendError):
+            self.parse(cli_result(envelope(is_error=True, subtype="error_max_turns")))
+
+    def test_non_json_output_escalates_with_the_text_quoted(self):
+        with self.assertRaises(BackendError) as caught:
+            self.parse(cli_result("command not found: claude", returncode=127))
+        self.assertIn("command not found", str(caught.exception))
+
+    def test_empty_output_reports_the_exit_code(self):
+        with self.assertRaises(BackendError) as caught:
+            self.parse(cli_result("", stderr="boom", returncode=1))
+        self.assertIn("boom", str(caught.exception))
+
+    def test_long_errors_are_clipped_so_a_pr_comment_stays_readable(self):
+        with self.assertRaises(BackendError) as caught:
+            self.parse(cli_result("x" * 5000, returncode=1))
+        self.assertLess(len(str(caught.exception)), 600)
+
+    def test_a_missing_cli_escalates_with_install_instructions(self):
+        backend = CliBackend(binary="definitely-not-a-real-binary-xyz")
+        with self.assertRaises(BackendError) as caught:
+            backend.complete("s", "u", judge_mod.VERDICT_SCHEMA, "m")
+        self.assertIn("isn't on PATH", str(caught.exception))
+
+
+class TestJudgeOverTheCli(unittest.TestCase):
+    """The judge must behave identically whichever backend answers."""
+
+    def test_a_cli_verdict_parses_like_an_api_one(self):
+        backend = FakeCliBackend(cli_result(envelope(structured_output={
+            "decision": "fix",
+            "confidence": 0.93,
+            "reason": "payments.py logs card.number.",
+            "fixed_code": [{"path": "checkout/payments.py", "content": "clean"}],
+        })))
+        verdict = judge(DIFF, backend=backend, rules="RULE")
+        self.assertEqual(verdict.decision, "fix")
+        self.assertEqual(verdict.changed_paths, ["checkout/payments.py"])
+
+    def test_the_diff_goes_on_stdin_not_in_the_argument_list(self):
+        # A large PR would blow past the OS argument-length limit.
+        backend = FakeCliBackend(cli_result(envelope(structured_output=VERDICT_PAYLOAD)))
+        judge(DIFF, backend=backend, rules="RULE ONE")
+        self.assertIn("RULE ONE", backend.stdin_used)
+        self.assertIn("card.number", backend.stdin_used)
+        self.assertNotIn("card.number", " ".join(backend.argv_used))
+
+    def test_a_cli_failure_escalates_rather_than_raising(self):
+        backend = FakeCliBackend(cli_result(envelope(
+            is_error=True, subtype="error_during_execution", result="not logged in"
+        )))
+        verdict = judge(DIFF, backend=backend, rules="RULE")
+        self.assertEqual(verdict.decision, "escalate")
+        self.assertEqual(verdict.confidence, 0.0)
+        self.assertIn("not logged in", verdict.reason)
+
+    def test_the_same_fail_safes_apply(self):
+        # 'fix' with nothing to apply escalates over the CLI too.
+        backend = FakeCliBackend(cli_result(envelope(structured_output={
+            "decision": "fix", "confidence": 0.95, "reason": "bad", "fixed_code": [],
+        })))
+        verdict = judge(DIFF, backend=backend, rules="RULE")
+        self.assertEqual(verdict.decision, "escalate")
+        self.assertIn("nothing to apply", verdict.reason)
+
+
+class TestBackendSelection(unittest.TestCase):
+    def setUp(self):
+        self._saved = {
+            key: os.environ.pop(key, None)
+            for key in ("PR_GUARDIAN_BACKEND", "ANTHROPIC_API_KEY")
+        }
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    def test_defaults_to_the_cli_when_there_is_no_api_key(self):
+        self.assertEqual(backends.select_backend_name(), backends.CLAUDE_CLI)
+
+    def test_defaults_to_the_api_when_a_key_is_set(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        self.assertEqual(backends.select_backend_name(), backends.API)
+
+    def test_the_env_var_overrides_the_key(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        os.environ["PR_GUARDIAN_BACKEND"] = "claude-cli"
+        self.assertEqual(backends.select_backend_name(), backends.CLAUDE_CLI)
+
+    def test_an_unknown_backend_name_fails_loudly(self):
+        os.environ["PR_GUARDIAN_BACKEND"] = "gpt"
+        with self.assertRaises(ValueError):
+            backends.select_backend_name()
+
+    def test_build_backend_returns_a_cli_backend_with_no_key(self):
+        self.assertIsInstance(backends.build_backend(), CliBackend)
 
 
 if __name__ == "__main__":

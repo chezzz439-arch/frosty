@@ -5,34 +5,29 @@ decoy PR in the demo -- a fake card number used as test data in a test file --
 contains the same digits as the real violation. Catching it fails the demo. So
 the rules go in the prompt as context, not as regexes.
 
-Why structured outputs rather than a tool call: the Messages API can constrain
-the whole response to a JSON Schema via `output_config.format`, which is one
-round trip and leaves no chance of a text-only reply we have to re-prompt for.
-A tool call would also work but needs the tool_use block extracted and can be
-skipped by the model. Documented at
-https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+Asking Claude is someone else's job: engine/backends.py has two backends (the
+anthropic SDK, and `claude -p` against a Claude Code subscription login) behind
+one `complete(system, user, schema, model) -> dict` call. Everything in this
+file is the same whichever one runs, which is the point -- the verdict must not
+change character because the Action happened to have a key or not.
 
-The API client is injected so the judge is testable without a key or a network
-call -- see engine/test_judge.py.
+The backend is injected so the judge is testable without a key, a CLI, or a
+network call -- see engine/test_judge.py.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
+from backends import ApiBackend, Backend, BackendError
 from db import DECISIONS
 
 # ASSUMPTION: Opus 4.8 is the right default -- this is the one step where a
 # wrong call is expensive (a bad fix that merges), so we don't trade accuracy
 # for cost here. Override with PR_GUARDIAN_MODEL.
 DEFAULT_MODEL = "claude-opus-4-8"
-
-# Non-streaming request, so keep max_tokens under the SDK's HTTP timeout
-# guard. Rewritten files are whole-file contents, hence not small.
-MAX_TOKENS = 16000
 
 # ASSUMPTION: /demo-data holds the rules file (it's Erik's folder, per
 # CLAUDE.md, and not written yet). Override with PR_GUARDIAN_RULES. If the file
@@ -140,13 +135,6 @@ Preserve the file's existing style and imports.
 Set confidence honestly. It gates whether anything merges without a human, so
 a high number on a guess costs more than a low number on a good call.
 """
-
-
-class _Client(Protocol):
-    """The slice of anthropic.Anthropic the judge uses. Lets tests pass a fake."""
-
-    @property
-    def messages(self) -> Any: ...
 
 
 @dataclass
@@ -292,81 +280,57 @@ def _coerce(payload: dict) -> Verdict:
     return verdict
 
 
-def _extract_json(response: Any) -> dict:
-    """Pull the JSON object out of the response's first text block.
-
-    With output_config.format set, the text block is guaranteed to be valid
-    JSON matching the schema -- unless the model refused or hit max_tokens,
-    both of which are checked by the caller.
-    """
-    for block in response.content:
-        if getattr(block, "type", None) == "text":
-            return json.loads(block.text)
-    raise ValueError("no text block in response")
-
-
 def judge(
     diff: dict,
-    client: _Client,
+    backend: Backend | None = None,
     rules: str | None = None,
     receipts: list[dict] | None = None,
     model: str | None = None,
+    client: Any | None = None,
 ) -> Verdict:
     """Judge one diff. Never raises: any failure becomes an escalation.
 
     That's deliberate. The engine runs unattended in a GitHub Action, and an
     exception there means no VERDICTS row at all, which /merge reads as "not
     judged yet" and the dashboard shows as a gap. An escalation is a real
-    outcome a human can act on.
+    outcome a human can act on. It holds for both backends: a missing CLI
+    login escalates exactly like a refused API call.
+
+    `client` is a shorthand for an anthropic client -- it's wrapped in an
+    ApiBackend -- so callers that already hold one don't have to know about
+    backends at all.
     """
+    if backend is None:
+        if client is None:
+            raise ValueError("judge() needs a backend (or an anthropic client)")
+        backend = ApiBackend(client)
+
     model = model or os.environ.get("PR_GUARDIAN_MODEL") or DEFAULT_MODEL
     rules = rules if rules is not None else load_rules()
     content = build_user_content(diff, rules, receipts or [])
 
     try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=MAX_TOKENS,
+        payload = backend.complete(
             system=SYSTEM_PROMPT,
-            thinking={"type": "adaptive"},
-            output_config={
-                "effort": "high",
-                "format": {"type": "json_schema", "schema": VERDICT_SCHEMA},
-            },
-            messages=[{"role": "user", "content": content}],
+            user=content,
+            schema=VERDICT_SCHEMA,
+            model=model,
         )
-    except Exception as exc:  # noqa: BLE001 - any API failure must escalate
+    except BackendError as exc:
+        # The backend already phrased this for a human reading the PR.
+        return Verdict(decision="escalate", confidence=0.0, reason=str(exc))
+    except Exception as exc:  # noqa: BLE001 - any failure at all must escalate
         return Verdict(
             decision="escalate",
             confidence=0.0,
             reason=f"Could not reach the judge ({type(exc).__name__}: {exc}).",
         )
 
-    stop_reason = getattr(response, "stop_reason", None)
-    if stop_reason == "refusal":
+    if not isinstance(payload, dict):
         return Verdict(
             decision="escalate",
             confidence=0.0,
-            reason="The judge declined to review this diff; a human should look.",
-        )
-    if stop_reason == "max_tokens":
-        # The JSON is truncated and unparseable. Escalate rather than guess.
-        return Verdict(
-            decision="escalate",
-            confidence=0.0,
-            reason=(
-                "The judge's response was cut off by the token limit, so the "
-                "verdict is incomplete. A human should review this diff."
-            ),
-        )
-
-    try:
-        payload = _extract_json(response)
-    except (ValueError, TypeError, AttributeError) as exc:
-        return Verdict(
-            decision="escalate",
-            confidence=0.0,
-            reason=f"Could not read the judge's response ({exc}).",
+            reason="The judge returned something that wasn't a verdict object.",
         )
 
     return _coerce(payload)

@@ -3,6 +3,10 @@
     python engine/run.py <pr_number>
     python engine/run.py <pr_number> --show   # print the trail, judge nothing
 
+Which backend asks Claude is decided in engine/backends.py: the anthropic SDK
+when ANTHROPIC_API_KEY is set, otherwise `claude -p` against the Claude Code
+login. Force one with PR_GUARDIAN_BACKEND=api|claude-cli.
+
 Not yet built (next step): applying `fixed_code` into a temp copy of the repo,
 running the test suite there, and retrying up to 3 times. Until that lands, a
 'fix' verdict is written with tests_passed NULL and attempts 0, so /merge's
@@ -11,29 +15,11 @@ gate ("fix AND tests_passed") correctly refuses to merge it.
 
 from __future__ import annotations
 
-import os
 import sys
 
 import db
+from backends import build_backend
 from judge import judge
-
-
-def _client():
-    """Build the Anthropic client. Imported lazily so --show and the test
-    suite work without the SDK installed or a key set."""
-    try:
-        import anthropic
-    except ImportError:
-        raise SystemExit(
-            "The anthropic SDK isn't installed. Run:\n"
-            "    pip install -r engine/requirements.txt"
-        )
-
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise SystemExit("ANTHROPIC_API_KEY isn't set.")
-
-    # Reads ANTHROPIC_API_KEY from the environment.
-    return anthropic.Anthropic()
 
 
 def show(pr_number: int) -> int:
@@ -77,10 +63,13 @@ def main(argv: list[str]) -> int:
     if "--show" in argv[1:]:
         return show(pr_number)
 
-    # Built before anything is logged: a missing SDK or key is a setup problem,
-    # not a step of the loop, and failing here avoids leaving a "running" event
-    # on the dashboard with nothing to follow it.
-    client = _client()
+    # Built before anything is logged: a missing SDK, key or CLI login is a
+    # setup problem, not a step of the loop, and failing here avoids leaving a
+    # "running" event on the dashboard with nothing to follow it.
+    try:
+        backend = build_backend()
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc))
 
     diff = db.read_diff(pr_number)
     if diff is None:
@@ -98,9 +87,14 @@ def main(argv: list[str]) -> int:
     )
 
     receipts = db.recent_receipts(limit=10)
-    db.log_event(pr_number, "decision made", "running", f"memory: {len(receipts)} receipt(s)")
+    db.log_event(
+        pr_number,
+        "decision made",
+        "running",
+        f"{backend.name} backend, memory: {len(receipts)} receipt(s)",
+    )
 
-    verdict = judge(diff, client=client, receipts=receipts)
+    verdict = judge(diff, backend=backend, receipts=receipts)
 
     db.write_verdict(
         pr_number=pr_number,
