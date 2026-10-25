@@ -776,5 +776,114 @@ class TestBackendSelection(unittest.TestCase):
         self.assertIsInstance(backends.build_backend(), CliBackend)
 
 
+def _generate_pem() -> str:
+    """A throwaway RSA key, so these tests need no real credential on disk."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+class TestSnowflakeCredentialsFromEnv(unittest.TestCase):
+    """The CI path: no snow CLI config, key arrives as a secret.
+
+    These check the shape of what db.py hands the connector. They never open a
+    connection -- the live check is `snow connection test`, not a unit test.
+    """
+
+    def setUp(self):
+        self._saved = {
+            name: os.environ.pop(name, None)
+            for name in (
+                *db.REQUIRED_ENV,
+                "SNOWFLAKE_WAREHOUSE",
+                "SNOWFLAKE_DATABASE",
+                "SNOWFLAKE_SCHEMA",
+                "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+            )
+        }
+        self.pem = _generate_pem()
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def _set_required(self):
+        os.environ["SNOWFLAKE_ACCOUNT"] = "ACC-1"
+        os.environ["SNOWFLAKE_USER"] = "someone"
+        os.environ["SNOWFLAKE_PRIVATE_KEY"] = self.pem
+
+    def test_no_env_means_fall_back_to_the_snow_cli_connection(self):
+        self.assertIsNone(db._env_connect_args())
+
+    def test_a_partial_set_is_ignored_rather_than_half_used(self):
+        # Half-configured CI must not look like a working connection.
+        os.environ["SNOWFLAKE_ACCOUNT"] = "ACC-1"
+        self.assertIsNone(db._env_connect_args())
+
+    def test_the_key_is_converted_to_der_not_passed_as_pem(self):
+        # The connector rejects PEM text outright:
+        # "251008: Failed to decode private key: Incorrect padding".
+        self._set_required()
+        args = db._env_connect_args()
+        self.assertIsInstance(args["private_key"], bytes)
+        self.assertNotIn(b"BEGIN PRIVATE KEY", args["private_key"])
+        self.assertEqual(args["authenticator"], "SNOWFLAKE_JWT")
+
+    def test_escaped_newlines_are_accepted(self):
+        # A key pasted into a secret often arrives with literal backslash-n.
+        self._set_required()
+        os.environ["SNOWFLAKE_PRIVATE_KEY"] = self.pem.replace("\n", "\\n")
+        flattened = db._env_connect_args()["private_key"]
+
+        os.environ["SNOWFLAKE_PRIVATE_KEY"] = self.pem
+        self.assertEqual(flattened, db._env_connect_args()["private_key"])
+
+    def test_context_defaults_to_the_contract_tables(self):
+        self._set_required()
+        args = db._env_connect_args()
+        self.assertEqual(args["database"], db.DATABASE)
+        self.assertEqual(args["schema"], db.SCHEMA)
+        self.assertEqual(args["warehouse"], db.WAREHOUSE)
+
+    def test_context_can_be_overridden(self):
+        self._set_required()
+        os.environ["SNOWFLAKE_SCHEMA"] = "STAGING"
+        self.assertEqual(db._env_connect_args()["schema"], "STAGING")
+
+    def test_an_unreadable_key_says_what_to_fix(self):
+        self._set_required()
+        os.environ["SNOWFLAKE_PRIVATE_KEY"] = "not a key"
+        with self.assertRaises(RuntimeError) as caught:
+            db._env_connect_args()
+        self.assertIn("BEGIN", str(caught.exception))
+
+    def test_a_blank_key_fails_loudly_rather_than_falling_back(self):
+        # A secret that exists but is empty is a misconfigured workflow.
+        # Falling back to the CLI connection would report "no config file" on
+        # a runner that has none, pointing at the wrong thing entirely.
+        self._set_required()
+        os.environ["SNOWFLAKE_PRIVATE_KEY"] = "   "
+        with self.assertRaises(RuntimeError) as caught:
+            db._env_connect_args()
+        self.assertIn("empty", str(caught.exception))
+
+    def test_the_private_key_never_appears_in_an_error_message(self):
+        # An exception from here lands in CI logs.
+        self._set_required()
+        os.environ["SNOWFLAKE_PRIVATE_KEY"] = self.pem[:120]
+        with self.assertRaises(RuntimeError) as caught:
+            db._env_connect_args()
+        self.assertNotIn(self.pem[60:120], str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

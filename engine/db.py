@@ -7,6 +7,20 @@ the same seam engine/backends.py uses for the judge.
     PR_GUARDIAN_DB_BACKEND=snowflake   (default)
     PR_GUARDIAN_DB_BACKEND=sqlite      (tests, offline work)
 
+Snowflake credentials come from one of two places. On a laptop it's the snow
+CLI connection named by PR_GUARDIAN_SNOWFLAKE_CONNECTION (default
+"hackathon2"). In CI there is no config file, so the Action sets:
+
+    SNOWFLAKE_ACCOUNT      e.g. FQWENHP-EC45741
+    SNOWFLAKE_USER
+    SNOWFLAKE_PRIVATE_KEY  the contents of rsa_key.p8, not a path
+    SNOWFLAKE_WAREHOUSE    optional, defaults to PR_GUARDIAN_WH
+    SNOWFLAKE_DATABASE     optional, defaults to PR_GUARDIAN
+    SNOWFLAKE_SCHEMA       optional, defaults to CORE
+
+All three required variables must be set together; when they are, they win
+over any config file on the runner.
+
 Everything outside this module uses only:
 
     read_diff(pr_number)        -> dict | None
@@ -128,6 +142,85 @@ def connection_name() -> str:
     return os.environ.get("PR_GUARDIAN_SNOWFLAKE_CONNECTION") or DEFAULT_CONNECTION
 
 
+# The three that have no sensible default. Everything else falls back to the
+# constants above, so Erik's Action only has to carry what's actually secret
+# or account-specific.
+REQUIRED_ENV = ("SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PRIVATE_KEY")
+
+
+def _private_key_der(text: str, passphrase: str | None = None) -> bytes:
+    """Turn the contents of an RSA private key into the DER bytes the
+    connector wants.
+
+    Snowflake's own docs only document `private_key_file`, a path -- which a
+    GitHub Action doesn't have, because the key arrives as a secret. The
+    connector also accepts `private_key`, but NOT as PEM text: handing it the
+    PEM straight from the file is rejected with
+
+        251008: Failed to decode private key: Incorrect padding
+        Please provide a valid ... key in base64-encoded DER format
+
+    So the PEM is parsed here and re-encoded as DER. Verified against the live
+    account rather than inferred from the type hints.
+
+    Both shapes a secret tends to arrive in are accepted: a real PEM block, and
+    one whose newlines were flattened to the two characters \\n, which is easy
+    to do when pasting a key into a secret or a .env file.
+    """
+    from cryptography.hazmat.primitives import serialization
+
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("SNOWFLAKE_PRIVATE_KEY is set but empty.")
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
+
+    try:
+        key = serialization.load_pem_private_key(
+            text.encode(),
+            password=passphrase.encode() if passphrase else None,
+        )
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"SNOWFLAKE_PRIVATE_KEY could not be read as a private key ({exc}). "
+            "It should be the whole file including the BEGIN and END lines. "
+            "If the key is encrypted, also set SNOWFLAKE_PRIVATE_KEY_PASSPHRASE."
+        ) from exc
+
+    return key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def _env_connect_args() -> dict | None:
+    """Connection arguments from the environment, or None if unconfigured.
+
+    CI has no snow CLI config file, so the Action passes the key as a secret
+    instead. When all three required variables are present they win over the
+    named connection -- a runner that happens to have a stale config.toml
+    should still use what the workflow handed it.
+    """
+    if not all(os.environ.get(name) for name in REQUIRED_ENV):
+        return None
+
+    return {
+        "account": os.environ["SNOWFLAKE_ACCOUNT"],
+        "user": os.environ["SNOWFLAKE_USER"],
+        # Explicit, per Snowflake's key-pair docs. The connector infers it from
+        # private_key anyway, but saying so makes the failure mode legible.
+        "authenticator": "SNOWFLAKE_JWT",
+        "private_key": _private_key_der(
+            os.environ["SNOWFLAKE_PRIVATE_KEY"],
+            os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"),
+        ),
+        "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE") or WAREHOUSE,
+        "database": os.environ.get("SNOWFLAKE_DATABASE") or DATABASE,
+        "schema": os.environ.get("SNOWFLAKE_SCHEMA") or SCHEMA,
+    }
+
+
 def db_path() -> str:
     return os.environ.get("PR_GUARDIAN_DB") or DEFAULT_DB_PATH
 
@@ -169,12 +262,17 @@ def snowflake_connection() -> Any:
             "PR_GUARDIAN_DB_BACKEND=sqlite to run without Snowflake."
         ) from exc
 
-    _SNOWFLAKE_CONN = snowflake.connector.connect(
-        connection_name=connection_name(),
-        database=DATABASE,
-        schema=SCHEMA,
-        warehouse=WAREHOUSE,
-    )
+    from_env = _env_connect_args()
+    if from_env is not None:
+        _SNOWFLAKE_CONN = snowflake.connector.connect(**from_env)
+    else:
+        # A laptop: the snow CLI config supplies account, user and key path.
+        _SNOWFLAKE_CONN = snowflake.connector.connect(
+            connection_name=connection_name(),
+            database=DATABASE,
+            schema=SCHEMA,
+            warehouse=WAREHOUSE,
+        )
     return _SNOWFLAKE_CONN
 
 
