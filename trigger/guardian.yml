@@ -1,0 +1,99 @@
+# PR Guardian workflow. TEMPLATE: demo-data/make_demo_repo.sh copies this into the demo shop
+# repo as .github/workflows/guardian.yml (GitHub only runs workflows from the repo the PR is in).
+#
+# On every PR it checks out two things:
+#   repo/      the PR being judged (the demo shop)
+#   guardian/  frosty: trigger, engine, merge and the trusted rules file
+# and runs:  1. trigger (Erik)  ->  2. engine (Kaushik)  ->  3. merge (Tejas)
+# Steps 2 and 3 are skipped, not failed, until their scripts exist on GUARDIAN_REF.
+name: PR Guardian
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: write        # merge, and pushing the fix commit
+  pull-requests: write   # receipt comment
+  issues: write          # the needs-human label
+
+concurrency:
+  group: guardian-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guardian:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_REPO: ${{ github.repository }}
+      PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+      # Snowflake (PR_GUARDIAN.CORE). Warehouse/database/schema default in trigger/sf.py.
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      # The judge: set ONE of these two secrets (an API key outranks the OAuth token).
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # Rules come from frosty, never from the PR: a PR must not be able to edit the rules it's judged by.
+      PR_GUARDIAN_RULES: ${{ github.workspace }}/guardian/demo-data/rules.md
+      # ASSUMPTION: names for the engine's sandbox step (not built yet). Agree these with Kaushik.
+      PR_GUARDIAN_REPO_DIR: ${{ github.workspace }}/repo
+      PR_GUARDIAN_TEST_CMD: python -m pytest -q
+      # Shared by trigger and engine while engine/db.py is still the local SQLite store.
+      PR_GUARDIAN_DB: ${{ github.workspace }}/.guardian-local/pr_guardian.db
+    steps:
+      - name: Check out the PR (full history, so the diff works)
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 0
+
+      - name: Check out Guardian (frosty)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GUARDIAN_REPO || 'chezzz439-arch/frosty' }}
+          ref: ${{ vars.GUARDIAN_REF || 'main' }}
+          path: guardian
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install -q -r repo/requirements-dev.txt
+          for f in guardian/trigger/requirements.txt guardian/engine/requirements.txt guardian/merge/requirements.txt; do
+            if [ -f "$f" ]; then pip install -q -r "$f"; fi
+          done
+
+      - name: Install Claude Code CLI (only when using the OAuth token)
+        if: env.CLAUDE_CODE_OAUTH_TOKEN != '' && env.ANTHROPIC_API_KEY == ''
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: "1 · Send diff to Guardian (Erik)"
+        working-directory: repo
+        run: python ../guardian/trigger/send_diff.py --from-event
+
+      - name: "2 · Judge, fix, test (Kaushik)"
+        run: |
+          if [ -f guardian/engine/run.py ]; then python guardian/engine/run.py "$PR_NUMBER"
+          else echo "::notice::guardian/engine/run.py not on GUARDIAN_REF yet, skipping"; fi
+
+      - name: "3 · Merge or label, receipt, Slack (Tejas)"
+        run: |
+          if [ -f guardian/merge/run.py ]; then python guardian/merge/run.py "$PR_NUMBER"
+          else echo "::notice::guardian/merge/run.py not on GUARDIAN_REF yet, skipping"; fi
+
+      - name: Show the trail
+        if: always()
+        run: |
+          if [ -f guardian/engine/run.py ]; then python guardian/engine/run.py "$PR_NUMBER" --show || true; fi
