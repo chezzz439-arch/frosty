@@ -34,11 +34,44 @@ def github(method, path, **kwargs):
     return response.json() if response.content else {}
 
 
+def private_key_der(text):
+    """PEM text -> DER bytes, which is the only form the connector accepts.
+
+    Passing the PEM string straight to `private_key` fails with
+    "251008: Failed to decode private key: Incorrect padding" -- the connector
+    wants base64-encoded DER, not PEM. Verified against Snowflake live; the
+    same conversion is in engine/db.py.
+    """
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(
+        text.replace('\\n', '\n').strip().encode(), password=None)
+    return key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption())
+
+
 def db_connect():
+    # Database/schema/warehouse are the four-table contract, not secrets, so
+    # they default here instead of being required env vars -- the workflow
+    # does not set them and a missing one aborted the merge step.
     args = dict(account=env('SNOWFLAKE_ACCOUNT'), user=env('SNOWFLAKE_USER'),
-                database=env('SNOWFLAKE_DATABASE'), schema=env('SNOWFLAKE_SCHEMA'),
-                warehouse=env('SNOWFLAKE_WAREHOUSE'))
-    if os.getenv('SNOWFLAKE_TOKEN'):
+                database=os.getenv('SNOWFLAKE_DATABASE') or 'PR_GUARDIAN',
+                schema=os.getenv('SNOWFLAKE_SCHEMA') or 'CORE',
+                warehouse=os.getenv('SNOWFLAKE_WAREHOUSE') or 'PR_GUARDIAN_WH')
+    if os.getenv('SNOWFLAKE_ROLE'):
+        args['role'] = os.environ['SNOWFLAKE_ROLE']
+    # Key-pair first: that is how this account actually authenticates. Password
+    # auth is left as a fallback but is not what the demo uses.
+    if os.getenv('SNOWFLAKE_PRIVATE_KEY'):
+        args.update(authenticator='SNOWFLAKE_JWT',
+                    private_key=private_key_der(os.environ['SNOWFLAKE_PRIVATE_KEY']))
+    elif os.getenv('SNOWFLAKE_PRIVATE_KEY_FILE'):
+        with open(os.environ['SNOWFLAKE_PRIVATE_KEY_FILE']) as handle:
+            args.update(authenticator='SNOWFLAKE_JWT',
+                        private_key=private_key_der(handle.read()))
+    elif os.getenv('SNOWFLAKE_TOKEN'):
         args.update(authenticator='oauth', token=os.environ['SNOWFLAKE_TOKEN'])
     else:
         args['password'] = env('SNOWFLAKE_PASSWORD')
